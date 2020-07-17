@@ -10,6 +10,7 @@ use tarpc::{
     server::{self, BaseChannel, Channel, Handler},
     transport::channel,
 };
+use tokio::join;
 use tokio_serde::formats::Json;
 
 #[tarpc_plugins::service]
@@ -82,8 +83,9 @@ async fn serde() -> io::Result<()> {
     Ok(())
 }
 
+/// Old concurrency test that doesn't actually use concurrency
 #[tokio::test(threaded_scheduler)]
-async fn concurrent() -> io::Result<()> {
+async fn concurrent_not_really() -> io::Result<()> {
     let _ = env_logger::try_init();
 
     let (tx, rx) = channel::unbounded();
@@ -107,6 +109,119 @@ async fn concurrent() -> io::Result<()> {
     assert_matches!(req1.await, Ok(3));
     assert_matches!(req2.await, Ok(7));
     assert_matches!(req3.await, Ok(ref s) if s == "Hey, Tim.");
+
+    Ok(())
+}
+
+/// Attempt at using join_all, which won't compile
+#[tokio::test(threaded_scheduler)]
+async fn concurrent_join_all() -> io::Result<()> {
+    let _ = env_logger::try_init();
+
+    let (tx, rx) = channel::unbounded();
+    tokio::spawn(
+        tarpc::Server::default()
+            .incoming(stream::once(ready(rx)))
+            .respond_with(Server.serve()),
+    );
+
+    let client = ServiceClient::new(client::Config::default(), tx).spawn()?;
+
+    let mut c = client.clone();
+    let _req1 = c.add(context::current(), 1, 2);
+
+    let mut c = client.clone();
+    let _req2 = c.add(context::current(), 3, 4);
+
+    let mut c = client.clone();
+    let _req3 = c.hey(context::current(), "Tim".to_string());
+
+    // This won't work if we try to compile it, with a common error seen in
+    // async development:
+    //
+    // ```
+    // let responses = join_all(vec![req1, req2, req3]).await;
+    //                                           ^^^^ expected opaque type, found a different opaque type
+    // = note: expected opaque type `impl core::future::future::Future`
+    //            found opaque type `impl core::future::future::Future`
+    // = note: distinct uses of `impl Trait` result in different opaque types
+    // ```
+    //
+    // The first note seems totally useless, since you'll tell yourself, "The
+    // compiler expects the type that's there, why the heck is it complaining?"
+    //
+    // The second note actually gives more clarity, hinting that `req3` has a
+    // different `impl Future` than `req1` and `req2`.
+    //
+    // The next error tells us even more:
+    //
+    // ```
+    // error[E0277]: can't compare `i32` with `str`
+    // assert_matches!(responses[2], Ok(ref s) if s == "Hey, Tim.");
+    //                                              ^^ no implementation for `i32 == str`
+    // ```
+    //
+    // For some reason, the type of `req3.await` is expected to be `i32` by
+    // the compiler.
+    // If we dig into the documentation for `join_all`, found at
+    // https://docs.rs/futures/0.3.5/futures/future/fn.join_all.html
+    // we'll find the wording clearly:
+    //
+    // "The returned future will drive execution for all of its underlying
+    // futures, collecting the results into a destination Vec<T> in the same
+    // order as they were provided."
+    //
+    // All of the `Future`s in the input to `join_all` must return the same type,
+    // which makes sense, since `Vec` cannot have different types contained.
+    //
+    // The next thought might be, "each Future implements the same trait
+    // as a `Future`, so what gives?"
+    // Looking at the source code for `core::future::Future` at
+    // https://doc.rust-lang.org/nightly/src/core/future/future.rs.html#32-101,
+    // you'll see the dependent type `Output` on line 35, meaning that `AddFut`,
+    // which is `impl Future<Output = i32>`, and `HeyFut`, which is
+    // `impl Future<Output = String>` are not compatible.
+    //
+    // let responses = join_all(vec![req1, req2, req3]).await;
+    // assert_matches!(responses[0], Ok(3));
+    // assert_matches!(responses[1], Ok(7));
+    // assert_matches!(responses[2], Ok(ref s) if s == "Hey, Tim.");
+
+    Ok(())
+}
+
+/// The best option, using the join! macro.  I would put this in a pull request.
+#[tokio::test(threaded_scheduler)]
+async fn concurrent_join() -> io::Result<()> {
+    let _ = env_logger::try_init();
+
+    let (tx, rx) = channel::unbounded();
+    tokio::spawn(
+        tarpc::Server::default()
+            .incoming(stream::once(ready(rx)))
+            .respond_with(Server.serve()),
+    );
+
+    let client = ServiceClient::new(client::Config::default(), tx).spawn()?;
+
+    let mut c = client.clone();
+    let req1 = c.add(context::current(), 1, 2);
+
+    let mut c = client.clone();
+    let req2 = c.add(context::current(), 3, 4);
+
+    let mut c = client.clone();
+    let req3 = c.hey(context::current(), "Tim".to_string());
+
+    // This version works because we're using a macro that doesn't require the
+    // same type-checking as with `join_all`.  Anything that supports `await`
+    // will work.  Another way to see this is that we are returning a tuple
+    // instead of a vector.
+    // `join!` documentation at https://docs.rs/tokio/0.2.21/tokio/macro.join.html
+    let (resp1, resp2, resp3) = join!(req1, req2, req3);
+    assert_matches!(resp1, Ok(3));
+    assert_matches!(resp2, Ok(7));
+    assert_matches!(resp3, Ok(ref s) if s == "Hey, Tim.");
 
     Ok(())
 }
