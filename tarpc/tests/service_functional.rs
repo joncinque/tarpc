@@ -1,6 +1,6 @@
 use assert_matches::assert_matches;
 use futures::{
-    future::{ready, Ready},
+    future::{join_all, ready, Ready},
     prelude::*,
 };
 use std::io;
@@ -115,7 +115,7 @@ async fn concurrent_not_really() -> io::Result<()> {
 
 /// Attempt at using join_all, which won't compile
 #[tokio::test(threaded_scheduler)]
-async fn concurrent_join_all() -> io::Result<()> {
+async fn concurrent_join_all_fail() -> io::Result<()> {
     let _ = env_logger::try_init();
 
     let (tx, rx) = channel::unbounded();
@@ -222,6 +222,64 @@ async fn concurrent_join() -> io::Result<()> {
     assert_matches!(resp1, Ok(3));
     assert_matches!(resp2, Ok(7));
     assert_matches!(resp3, Ok(ref s) if s == "Hey, Tim.");
+
+    Ok(())
+}
+
+/// Using join_all in a way that works
+#[tokio::test(threaded_scheduler)]
+async fn concurrent_join_all_workaround() -> io::Result<()> {
+    let _ = env_logger::try_init();
+
+    let (tx, rx) = channel::unbounded();
+    tokio::spawn(
+        tarpc::Server::default()
+            .incoming(stream::once(ready(rx)))
+            .respond_with(Server.serve()),
+    );
+
+    let client = ServiceClient::new(client::Config::default(), tx).spawn()?;
+
+    let mut c1 = client.clone();
+    let mut c2 = client.clone();
+    // Since creating a future amounts to "consuming" the client without really
+    // consuming it, we create both of the clients beforehand, which actually
+    // allows join_all to compile correctly.
+    let req1 = c1.add(context::current(), 1, 2);
+    let req2 = c2.add(context::current(), 3, 4);
+
+    let responses = join_all(vec![req1, req2]).await;
+    assert_matches!(responses[0], Ok(3));
+    assert_matches!(responses[1], Ok(7));
+
+    Ok(())
+}
+
+/// Using join_all in a way that works
+#[tokio::test(threaded_scheduler)]
+async fn concurrent_join_all() -> io::Result<()> {
+    let _ = env_logger::try_init();
+
+    let (tx, rx) = channel::unbounded();
+    tokio::spawn(
+        tarpc::Server::default()
+            .incoming(stream::once(ready(rx)))
+            .respond_with(Server.serve()),
+    );
+
+    let client = ServiceClient::new(client::Config::default(), tx).spawn()?;
+
+    let mut c1 = client.clone();
+    let mut c2 = client.clone();
+    // Since creating a future amounts to "consuming" the client without really
+    // consuming it, we create both of the clients beforehand, which actually
+    // allows join_all to compile correctly.
+    let req1 = c1.add(context::current(), 1, 2);
+    let req2 = c2.add(context::current(), 3, 4);
+
+    let responses = join_all(vec![req1, req2]).await;
+    assert_matches!(responses[0], Ok(3));
+    assert_matches!(responses[1], Ok(7));
 
     Ok(())
 }
